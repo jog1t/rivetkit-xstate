@@ -21,6 +21,288 @@ export type SyncStrategy = 'on-transition' | 'on-event' | 'manual';
 export type ErrorCallback = (error: Error, snapshot: Snapshot<unknown>) => void;
 
 /**
+ * Result type for callbacks that can reject operations
+ */
+export type CallbackResult =
+  | { allowed: true; reason?: never }
+  | { allowed: false; reason: string };
+
+/**
+ * Context provided to lifecycle callbacks
+ */
+export interface LifecycleCallbackContext {
+  /**
+   * Current actor state (RivetKit state)
+   */
+  state: FsmActorState;
+
+  /**
+   * Input provided to onCreate
+   */
+  input?: { snapshot?: string; context?: unknown };
+
+  /**
+   * Additional metadata
+   */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Context provided to request callbacks
+ */
+export interface RequestCallbackContext {
+  /**
+   * HTTP Request object
+   */
+  request: Request;
+
+  /**
+   * Current XState snapshot
+   */
+  snapshot: Snapshot<unknown>;
+
+  /**
+   * Current RivetKit state
+   */
+  state: FsmActorState;
+
+  /**
+   * Request metadata (headers, method, url, etc.)
+   */
+  metadata: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+  };
+}
+
+/**
+ * Context provided to WebSocket callbacks
+ */
+export interface WebSocketCallbackContext {
+  /**
+   * WebSocket connection
+   */
+  ws: WebSocket;
+
+  /**
+   * Current XState snapshot
+   */
+  snapshot: Snapshot<unknown>;
+
+  /**
+   * Current RivetKit state
+   */
+  state: FsmActorState;
+
+  /**
+   * Connection metadata
+   */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Context provided to event callbacks
+ */
+export interface EventCallbackContext {
+  /**
+   * The event being sent
+   */
+  event: EventObject;
+
+  /**
+   * Current XState snapshot before event
+   */
+  snapshot: Snapshot<unknown>;
+
+  /**
+   * Current RivetKit state
+   */
+  state: FsmActorState;
+
+  /**
+   * Source of the event (http, websocket, internal)
+   */
+  source: 'http' | 'websocket' | 'internal';
+}
+
+/**
+ * Context provided to transition callbacks
+ */
+export interface TransitionCallbackContext {
+  /**
+   * Snapshot before transition
+   */
+  previousSnapshot: Snapshot<unknown>;
+
+  /**
+   * Snapshot after transition
+   */
+  currentSnapshot: Snapshot<unknown>;
+
+  /**
+   * Event that triggered the transition
+   */
+  event: EventObject;
+
+  /**
+   * Current RivetKit state
+   */
+  state: FsmActorState;
+}
+
+/**
+ * Context provided to state sync callbacks
+ */
+export interface StateSyncCallbackContext {
+  /**
+   * Current XState snapshot to be synced
+   */
+  snapshot: Snapshot<unknown>;
+
+  /**
+   * Current RivetKit state
+   */
+  state: FsmActorState;
+
+  /**
+   * Persistence mode being used
+   */
+  persistenceMode: PersistenceMode;
+}
+
+/**
+ * Comprehensive hooks for FSM actor lifecycle and operations
+ */
+export interface FsmActorHooks {
+  /**
+   * Called before actor is created
+   * Can reject actor creation by returning { allowed: false }
+   */
+  beforeCreate?: (
+    ctx: LifecycleCallbackContext
+  ) => CallbackResult | Promise<CallbackResult>;
+
+  /**
+   * Called after actor is successfully created
+   */
+  afterCreate?: (ctx: LifecycleCallbackContext) => void | Promise<void>;
+
+  /**
+   * Called before actor wakes from hibernation
+   * Can reject wake by returning { allowed: false }
+   */
+  beforeWake?: (
+    ctx: LifecycleCallbackContext
+  ) => CallbackResult | Promise<CallbackResult>;
+
+  /**
+   * Called after actor wakes from hibernation
+   */
+  afterWake?: (ctx: LifecycleCallbackContext) => void | Promise<void>;
+
+  /**
+   * Called before processing an HTTP request
+   * Can reject request by returning { allowed: false }
+   * Useful for authentication, authorization, rate limiting
+   */
+  beforeRequest?: (
+    ctx: RequestCallbackContext
+  ) => CallbackResult | Promise<CallbackResult>;
+
+  /**
+   * Called after processing an HTTP request
+   */
+  afterRequest?: (
+    ctx: RequestCallbackContext,
+    response: Response
+  ) => void | Promise<void>;
+
+  /**
+   * Called when a WebSocket connection is established
+   * Can reject connection by returning { allowed: false }
+   * Useful for authentication, connection limits
+   */
+  beforeConnect?: (
+    ctx: WebSocketCallbackContext
+  ) => CallbackResult | Promise<CallbackResult>;
+
+  /**
+   * Called when a WebSocket connection is closed
+   */
+  onDisconnect?: (ctx: WebSocketCallbackContext) => void | Promise<void>;
+
+  /**
+   * Called before processing a WebSocket message
+   * Can reject message by returning { allowed: false }
+   * Can transform the event by returning modified event
+   */
+  beforeMessage?: (
+    ctx: WebSocketCallbackContext & { message: FsmWebSocketMessage }
+  ) =>
+    | CallbackResult
+    | Promise<CallbackResult>
+    | { allowed: true; event?: EventObject }
+    | Promise<{ allowed: true; event?: EventObject }>;
+
+  /**
+   * Called after processing a WebSocket message
+   */
+  afterMessage?: (
+    ctx: WebSocketCallbackContext & { message: FsmWebSocketMessage }
+  ) => void | Promise<void>;
+
+  /**
+   * Called before sending an event to the XState machine
+   * Can reject event by returning { allowed: false }
+   * Can transform the event by returning modified event
+   * Acts as a guard for all state transitions
+   */
+  beforeEvent?: (
+    ctx: EventCallbackContext
+  ) =>
+    | CallbackResult
+    | Promise<CallbackResult>
+    | { allowed: true; event?: EventObject }
+    | Promise<{ allowed: true; event?: EventObject }>;
+
+  /**
+   * Called after an event is sent to the XState machine
+   */
+  afterEvent?: (ctx: EventCallbackContext) => void | Promise<void>;
+
+  /**
+   * Called before a state transition occurs
+   * Can reject transition by returning { allowed: false }
+   * Note: This is called during XState's subscription, after the transition
+   * Use beforeEvent to prevent transitions before they happen
+   */
+  beforeTransition?: (
+    ctx: TransitionCallbackContext
+  ) => CallbackResult | Promise<CallbackResult>;
+
+  /**
+   * Called after a state transition completes
+   */
+  afterTransition?: (
+    ctx: TransitionCallbackContext
+  ) => void | Promise<void>;
+
+  /**
+   * Called before syncing state to RivetKit storage
+   * Can prevent sync by returning { allowed: false }
+   */
+  beforeStateSync?: (
+    ctx: StateSyncCallbackContext
+  ) => CallbackResult | Promise<CallbackResult>;
+
+  /**
+   * Called after syncing state to RivetKit storage
+   */
+  afterStateSync?: (ctx: StateSyncCallbackContext) => void | Promise<void>;
+}
+
+/**
  * Configuration options for FSM actor
  */
 export interface FsmActorConfig {
@@ -66,6 +348,12 @@ export interface FsmActorConfig {
    * @default false
    */
   debug?: boolean;
+
+  /**
+   * Lifecycle and operational hooks
+   * Allows custom logic for authentication, authorization, validation, etc.
+   */
+  hooks?: FsmActorHooks;
 }
 
 /**

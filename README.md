@@ -7,6 +7,8 @@ Embed [XState](https://stately.ai/docs/xstate) finite state machines as [RivetKi
 - **Seamless Integration**: Run XState machines as long-lived RivetKit actors
 - **Full State Persistence**: State automatically persists across hibernation cycles
 - **Realtime Updates**: WebSocket support for live state synchronization
+- **Comprehensive Hooks**: Authentication, authorization, validation, and audit logging
+- **RivetKit Actions**: Type-safe actor operations via built-in action system
 - **Flexible Configuration**: Choose your persistence mode, error handling, and sync strategy
 - **Type-Safe**: Full TypeScript support with type inference
 - **Zero Config**: Works out of the box with sensible defaults
@@ -61,45 +63,58 @@ export const toggle = createFsmActor(toggleMachine, {
 
 ## Usage
 
-### Sending Events
+### Using RivetKit Actions
 
-**Via HTTP:**
-```bash
-curl -X POST http://localhost:3000/actors/toggle/http/event \
-  -H "Content-Type: application/json" \
-  -d '{"type":"TOGGLE"}'
+The FSM actor exposes three built-in actions:
+
+**Via RivetKit Client SDK:**
+```typescript
+import { RivetClient } from 'rivet-client';
+
+const client = new RivetClient({ endpoint: 'http://localhost:3000' });
+const toggleActor = client.actor('toggle');
+
+// Get current state
+const state = await toggleActor.call('getState');
+console.log(state); // { state: 'inactive', context: { count: 0 }, done: false }
+
+// Send event
+const newState = await toggleActor.call('sendEvent', { type: 'TOGGLE' });
+console.log(newState); // { state: 'active', context: { count: 1 }, done: false }
+
+// Manually trigger state sync
+await toggleActor.call('syncState');
 ```
 
-**Via WebSocket:**
+### Using WebSocket
+
+**Realtime bidirectional communication:**
 ```javascript
 const ws = new WebSocket('ws://localhost:3000/actors/toggle/ws');
 
-// Send event
-ws.send(JSON.stringify({ type: 'TOGGLE' }));
-
-// Receive state updates
+// Receive initial state and updates
 ws.onmessage = (event) => {
-  const { state, context } = JSON.parse(event.data);
-  console.log('New state:', state, 'Context:', context);
+  const data = JSON.parse(event.data);
+
+  if (data.type === 'STATE') {
+    console.log('State:', data.state);
+    console.log('Context:', data.context);
+  } else if (data.type === 'ERROR') {
+    console.error('Error:', data.error);
+  }
 };
+
+// Send events
+ws.send(JSON.stringify({ type: 'TOGGLE' }));
 ```
 
-### Querying State
+### Available Actions
 
-**Via HTTP:**
-```bash
-curl http://localhost:3000/actors/toggle/http/state
-```
-
-**Response:**
-```json
-{
-  "state": "active",
-  "context": { "count": 5 },
-  "done": false,
-  "output": null
-}
-```
+| Action | Parameters | Returns | Description |
+|--------|------------|---------|-------------|
+| `getState` | None | `FsmResponse` | Get current FSM state |
+| `sendEvent` | `EventObject` | Updated state | Send event to FSM |
+| `syncState` | None | `{ success: boolean }` | Force state sync |
 
 ## Configuration
 
@@ -207,12 +222,252 @@ createFsmActor(machine, {
 ```
 Custom error handling logic.
 
+## Hooks
+
+Hooks allow you to inject custom logic at various points in the actor lifecycle. Perfect for authentication, authorization, validation, and audit logging.
+
+### Available Hooks
+
+#### Lifecycle Hooks
+
+**beforeCreate / afterCreate**
+```typescript
+hooks: {
+  beforeCreate: async ({ state, input, metadata }) => {
+    // Validate creation, check quotas, etc.
+    return { allowed: true };
+  },
+  afterCreate: async ({ state, input, metadata }) => {
+    // Log creation, notify monitoring, etc.
+  }
+}
+```
+
+**beforeWake / afterWake**
+```typescript
+hooks: {
+  beforeWake: async ({ state, metadata }) => {
+    // Check if wake is allowed
+    return { allowed: true };
+  },
+  afterWake: async ({ state, metadata }) => {
+    // Reinitialize resources after hibernation
+  }
+}
+```
+
+#### WebSocket Hooks
+
+**beforeConnect**
+```typescript
+hooks: {
+  beforeConnect: async ({ ws, snapshot, state, metadata }) => {
+    // Authenticate WebSocket connection
+    const token = extractToken(ws);
+    const user = await authenticateToken(token);
+
+    if (!user) {
+      return { allowed: false, reason: 'Invalid token' };
+    }
+
+    return { allowed: true };
+  }
+}
+```
+
+**onDisconnect**
+```typescript
+hooks: {
+  onDisconnect: async ({ ws, snapshot, state, metadata }) => {
+    // Cleanup, update online status, etc.
+    console.log('User disconnected');
+  }
+}
+```
+
+**beforeMessage / afterMessage**
+```typescript
+hooks: {
+  beforeMessage: async ({ ws, snapshot, state, metadata, message }) => {
+    // Validate message, rate limit, etc.
+    if (message.text.length > 500) {
+      return { allowed: false, reason: 'Message too long' };
+    }
+
+    // Can transform the event
+    return {
+      allowed: true,
+      event: { ...message, timestamp: Date.now() }
+    };
+  },
+  afterMessage: async ({ ws, snapshot, state, metadata, message }) => {
+    // Log message, update metrics, etc.
+  }
+}
+```
+
+#### Event Hooks
+
+**beforeEvent / afterEvent**
+```typescript
+hooks: {
+  beforeEvent: async ({ event, snapshot, state, source }) => {
+    // Role-based access control
+    const userRole = event.userRole;
+
+    if (event.type === 'DELETE' && userRole !== 'admin') {
+      return { allowed: false, reason: 'Admin only' };
+    }
+
+    // Can transform the event
+    return {
+      allowed: true,
+      event: { ...event, processedAt: Date.now() }
+    };
+  },
+  afterEvent: async ({ event, snapshot, state, source }) => {
+    // Audit log
+    console.log('[AUDIT]', {
+      event: event.type,
+      state: snapshot.value,
+      source
+    });
+  }
+}
+```
+
+#### Transition Hooks
+
+**beforeTransition / afterTransition**
+```typescript
+hooks: {
+  beforeTransition: async ({
+    previousSnapshot,
+    currentSnapshot,
+    event,
+    state
+  }) => {
+    // Validate transition (note: can't actually prevent at this point)
+    // Use beforeEvent to prevent transitions proactively
+    console.log(`Transitioning: ${previousSnapshot.value} → ${currentSnapshot.value}`);
+    return { allowed: true };
+  },
+  afterTransition: async ({
+    previousSnapshot,
+    currentSnapshot,
+    event,
+    state
+  }) => {
+    // Notify external systems, trigger side effects
+    if (currentSnapshot.value === 'completed') {
+      await notifyCompletion();
+    }
+  }
+}
+```
+
+#### State Sync Hooks
+
+**beforeStateSync / afterStateSync**
+```typescript
+hooks: {
+  beforeStateSync: async ({ snapshot, state, persistenceMode }) => {
+    // Control when state is persisted
+    const messageCount = snapshot.context?.messages?.length || 0;
+
+    if (messageCount > 10000) {
+      return { allowed: false, reason: 'Too many messages' };
+    }
+
+    return { allowed: true };
+  },
+  afterStateSync: async ({ snapshot, state, persistenceMode }) => {
+    // Trigger cache updates, webhooks, etc.
+    await updateCache(snapshot);
+  }
+}
+```
+
+### Common Use Cases
+
+#### Authentication & Authorization
+```typescript
+export const secureActor = createFsmActor(machine, {
+  hooks: {
+    beforeConnect: authenticateWebSocket,
+    beforeEvent: checkPermissions,
+    afterEvent: auditLog,
+  }
+});
+```
+
+#### Rate Limiting
+```typescript
+const rateLimiter = new Map();
+
+export const limitedActor = createFsmActor(machine, {
+  hooks: {
+    beforeEvent: async ({ event }) => {
+      const userId = event.userId;
+      const count = rateLimiter.get(userId) || 0;
+
+      if (count > 100) {
+        return { allowed: false, reason: 'Rate limit exceeded' };
+      }
+
+      rateLimiter.set(userId, count + 1);
+      return { allowed: true };
+    }
+  }
+});
+```
+
+#### Validation
+```typescript
+export const validatedActor = createFsmActor(machine, {
+  hooks: {
+    beforeEvent: async ({ event, snapshot }) => {
+      // Validate event payload
+      if (event.type === 'UPDATE' && !event.data) {
+        return { allowed: false, reason: 'Missing data' };
+      }
+
+      // Validate state constraints
+      if (snapshot.value === 'locked') {
+        return { allowed: false, reason: 'State is locked' };
+      }
+
+      return { allowed: true };
+    }
+  }
+});
+```
+
+### Hook Return Types
+
+Hooks that can reject operations return `CallbackResult`:
+
+```typescript
+type CallbackResult =
+  | { allowed: true; reason?: never }
+  | { allowed: false; reason: string };
+```
+
+Some hooks can also transform events:
+
+```typescript
+type EventTransformResult =
+  | CallbackResult
+  | { allowed: true; event?: EventObject };
+```
+
 ## Examples
 
 See the [`examples/`](./examples) directory for complete examples:
 
 - **[basic-toggle](./examples/basic-toggle)** - Simple two-state toggle machine
 - **[traffic-light](./examples/traffic-light)** - Multi-state machine with complex transitions
+- **[secure-chat](./examples/secure-chat)** - Chat room with authentication, authorization, and hooks
 
 ## Architecture
 
@@ -255,22 +510,78 @@ Creates a RivetKit actor from an XState machine.
 
 **Parameters:**
 - `machine` - XState machine definition (from `createMachine()`)
-- `config` - Optional configuration object
+- `config` - Optional configuration object (see FsmActorConfig)
 
 **Returns:** RivetKit actor ready for deployment
 
-### HTTP Endpoints
+### RivetKit Actions
 
-When deployed, your FSM actor exposes:
+The FSM actor automatically exposes these actions via RivetKit's action system:
 
-- `GET /actors/{actorName}/http/state` - Get current state
-- `POST /actors/{actorName}/http/event` - Send event to machine
+#### `getState()`
 
-### WebSocket Events
+Get the current FSM state.
 
-**Client → Server (Events):**
+**Parameters:** None
+
+**Returns:** `FsmResponse`
+```typescript
+{
+  state: unknown;        // Current state value
+  context: unknown;      // Current context
+  done: boolean;         // Whether in final state
+  output?: unknown;      // Output if in final state
+  error?: {              // Last error (if any)
+    message: string;
+    timestamp: number;
+  };
+}
+```
+
+**Example:**
+```typescript
+const state = await actor.call('getState');
+```
+
+#### `sendEvent(event)`
+
+Send an event to the FSM.
+
+**Parameters:**
+- `event: EventObject` - The event to send to the machine
+
+**Returns:** Updated state (same structure as `FsmResponse`)
+
+**Example:**
+```typescript
+const newState = await actor.call('sendEvent', {
+  type: 'TOGGLE',
+  userId: '123',
+  timestamp: Date.now()
+});
+```
+
+#### `syncState()`
+
+Manually trigger state synchronization to RivetKit storage.
+
+**Parameters:** None
+
+**Returns:** `{ success: boolean }`
+
+**Example:**
+```typescript
+await actor.call('syncState');
+```
+
+### WebSocket Protocol
+
+**Client → Server (Send Events):**
 ```json
-{ "type": "EVENT_NAME", ...payload }
+{
+  "type": "EVENT_NAME",
+  ...eventPayload
+}
 ```
 
 **Server → Client (State Updates):**
@@ -281,6 +592,14 @@ When deployed, your FSM actor exposes:
   "context": { ... },
   "done": false,
   "output": null
+}
+```
+
+**Server → Client (Errors):**
+```json
+{
+  "type": "ERROR",
+  "error": "Error message"
 }
 ```
 

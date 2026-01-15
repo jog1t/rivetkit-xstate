@@ -3,12 +3,14 @@ import {
   type AnyStateMachine,
   createActor as createXStateActor,
   type Snapshot,
+  type EventObject,
 } from 'xstate';
 import type {
   FsmActorConfig,
   FsmActorState,
   FsmWebSocketMessage,
   FsmResponse,
+  CallbackResult,
 } from './types';
 import {
   serializeSnapshot,
@@ -18,6 +20,15 @@ import {
   minimalRivetState,
 } from '../utils/serialization';
 import { Logger } from '../utils/logger';
+
+/**
+ * Helper to check callback result and throw if rejected
+ */
+function checkCallbackResult(result: CallbackResult, operation: string): void {
+  if (!result.allowed) {
+    throw new Error(`${operation} rejected: ${result.reason}`);
+  }
+}
 
 /**
  * Creates a RivetKit actor that embeds an XState finite state machine.
@@ -36,9 +47,15 @@ import { Logger } from '../utils/logger';
  *   }
  * });
  *
- * const toggleActor = createFsmActor(toggleMachine, {
+ * export const toggle = createFsmActor(toggleMachine, {
  *   persistenceMode: 'full',
- *   debug: true
+ *   debug: true,
+ *   hooks: {
+ *     beforeEvent: async (ctx) => {
+ *       // Check permissions, validate event, etc.
+ *       return { allowed: true };
+ *     }
+ *   }
  * });
  * ```
  *
@@ -57,9 +74,14 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
     debug = false,
     metadata = {},
     errorCallback,
+    hooks = {},
   } = config;
 
   const logger = new Logger(debug, `[rivetkit-xstate:${machine.id || 'fsm'}]`);
+
+  // Store previous snapshot for transition callbacks
+  let previousSnapshot: Snapshot<unknown> | null = null;
+  let lastEvent: EventObject | null = null;
 
   return actor({
     state: {
@@ -72,6 +94,16 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
     onCreate: async (ctx, input?: { snapshot?: string; context?: unknown }) => {
       logger.log('Creating FSM actor');
 
+      // Call beforeCreate hook
+      if (hooks.beforeCreate) {
+        const result = await hooks.beforeCreate({
+          state: ctx.state.fsm,
+          input,
+          metadata,
+        });
+        checkCallbackResult(result, 'Actor creation');
+      }
+
       try {
         // Create XState actor
         const xstateActor = createXStateActor(machine, {
@@ -83,11 +115,31 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
 
         // Store reference in context (non-persisted ephemeral data)
         (ctx as any).xstateActor = xstateActor;
+        (ctx as any).hooks = hooks;
+        (ctx as any).persistenceMode = persistenceMode;
+        (ctx as any).metadata = metadata;
 
         // Subscribe to state changes
         xstateActor.subscribe({
-          next: (snapshot: Snapshot<unknown>) => {
+          next: async (snapshot: Snapshot<unknown>) => {
             logger.log('State transition:', snapshot.value);
+
+            // Call beforeTransition hook
+            if (hooks.beforeTransition && previousSnapshot) {
+              try {
+                const result = await hooks.beforeTransition({
+                  previousSnapshot,
+                  currentSnapshot: snapshot,
+                  event: lastEvent || { type: 'INIT' },
+                  state: ctx.state.fsm,
+                });
+                checkCallbackResult(result, 'State transition');
+              } catch (error) {
+                logger.error('beforeTransition hook rejected:', error);
+                // Note: Can't actually roll back transition at this point
+                // Use beforeEvent hook to prevent transitions proactively
+              }
+            }
 
             // Handle errors
             if (snapshot.status === 'error' && snapshot.error) {
@@ -109,8 +161,28 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
 
             // Sync state based on strategy
             if (syncStrategy === 'on-transition') {
-              syncStateToRivet(ctx, snapshot, persistenceMode, metadata);
+              await syncStateToRivet(
+                ctx,
+                snapshot,
+                persistenceMode,
+                metadata,
+                hooks,
+                logger
+              );
             }
+
+            // Call afterTransition hook
+            if (hooks.afterTransition && previousSnapshot) {
+              await hooks.afterTransition({
+                previousSnapshot,
+                currentSnapshot: snapshot,
+                event: lastEvent || { type: 'INIT' },
+                state: ctx.state.fsm,
+              });
+            }
+
+            // Update previous snapshot for next transition
+            previousSnapshot = snapshot;
           },
           error: (error: Error) => {
             logger.error('XState actor error:', error);
@@ -131,12 +203,29 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
 
         // Initial state sync
         const snapshot = xstateActor.getSnapshot();
-        syncStateToRivet(ctx, snapshot, persistenceMode, metadata);
+        previousSnapshot = snapshot;
+        await syncStateToRivet(
+          ctx,
+          snapshot,
+          persistenceMode,
+          metadata,
+          hooks,
+          logger
+        );
 
         logger.log('FSM actor initialized', {
           initialState: snapshot.value,
           persistenceMode,
         });
+
+        // Call afterCreate hook
+        if (hooks.afterCreate) {
+          await hooks.afterCreate({
+            state: ctx.state.fsm,
+            input,
+            metadata,
+          });
+        }
       } catch (error) {
         logger.error('Failed to create FSM actor:', error);
         throw error;
@@ -144,81 +233,264 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
     },
 
     /**
-     * Handle HTTP requests - returns current state and accepts events
+     * Restore XState actor on wake from hibernation
      */
-    onRequest: async (ctx, request: Request): Promise<Response | void> => {
-      const xstateActor = (ctx as any).xstateActor;
-      if (!xstateActor) {
-        return new Response('FSM actor not initialized', { status: 500 });
+    onWake: async (ctx) => {
+      logger.log('Waking FSM actor from hibernation');
+
+      // Call beforeWake hook
+      if (hooks.beforeWake) {
+        const result = await hooks.beforeWake({
+          state: ctx.state.fsm,
+          metadata,
+        });
+        checkCallbackResult(result, 'Actor wake');
       }
 
-      const url = new URL(request.url);
+      try {
+        const storedState = ctx.state.fsm;
 
-      // GET - Return current state
-      if (request.method === 'GET' && url.pathname.endsWith('/state')) {
+        // Recreate XState actor from persisted state
+        const xstateActor = createXStateActor(machine, {
+          snapshot: storedState.snapshot
+            ? deserializeSnapshot(storedState.snapshot)
+            : undefined,
+        });
+
+        // Store reference
+        (ctx as any).xstateActor = xstateActor;
+        (ctx as any).hooks = hooks;
+        (ctx as any).persistenceMode = persistenceMode;
+        (ctx as any).metadata = metadata;
+
+        // Re-subscribe to state changes
+        xstateActor.subscribe({
+          next: async (snapshot: Snapshot<unknown>) => {
+            if (hooks.beforeTransition && previousSnapshot) {
+              try {
+                const result = await hooks.beforeTransition({
+                  previousSnapshot,
+                  currentSnapshot: snapshot,
+                  event: lastEvent || { type: 'WAKE' },
+                  state: ctx.state.fsm,
+                });
+                checkCallbackResult(result, 'State transition');
+              } catch (error) {
+                logger.error('beforeTransition hook rejected:', error);
+              }
+            }
+
+            if (syncStrategy === 'on-transition') {
+              await syncStateToRivet(
+                ctx,
+                snapshot,
+                persistenceMode,
+                metadata,
+                hooks,
+                logger
+              );
+            }
+
+            if (hooks.afterTransition && previousSnapshot) {
+              await hooks.afterTransition({
+                previousSnapshot,
+                currentSnapshot: snapshot,
+                event: lastEvent || { type: 'WAKE' },
+                state: ctx.state.fsm,
+              });
+            }
+
+            previousSnapshot = snapshot;
+          },
+          error: (error: Error) => {
+            logger.error('XState actor error after wake:', error);
+            if (errorHandling === 'crash') {
+              throw error;
+            } else if (errorHandling === 'callback' && errorCallback) {
+              errorCallback(error, xstateActor.getSnapshot());
+            }
+          },
+        });
+
+        // Start the actor
+        xstateActor.start();
+        previousSnapshot = xstateActor.getSnapshot();
+
+        logger.log('FSM actor restored', {
+          currentState: xstateActor.getSnapshot().value,
+        });
+
+        // Call afterWake hook
+        if (hooks.afterWake) {
+          await hooks.afterWake({
+            state: ctx.state.fsm,
+            metadata,
+          });
+        }
+      } catch (error) {
+        logger.error('Failed to wake FSM actor:', error);
+        throw error;
+      }
+    },
+
+    /**
+     * RivetKit actions - type-safe actor operations
+     */
+    actions: {
+      /**
+       * Get current FSM state
+       */
+      getState: (ctx): FsmResponse => {
+        const xstateActor = (ctx as any).xstateActor;
+        if (!xstateActor) {
+          throw new Error('FSM actor not initialized');
+        }
+
         const snapshot = xstateActor.getSnapshot();
-        const response: FsmResponse = {
+        return {
           state: snapshot.value,
           context: snapshot.context,
           done: snapshot.status === 'done',
           output: snapshot.output,
           error: ctx.state.fsm.lastError,
         };
+      },
 
-        return new Response(JSON.stringify(response), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
+      /**
+       * Send an event to the FSM
+       */
+      sendEvent: async (ctx, event: EventObject) => {
+        const xstateActor = (ctx as any).xstateActor;
+        const hooks = (ctx as any).hooks || {};
+        const persistenceMode = (ctx as any).persistenceMode;
+        const metadata = (ctx as any).metadata;
 
-      // POST - Send event
-      if (request.method === 'POST' && url.pathname.endsWith('/event')) {
-        try {
-          const event = await request.json();
-          logger.log('Sending event via HTTP:', event);
+        if (!xstateActor) {
+          throw new Error('FSM actor not initialized');
+        }
 
-          xstateActor.send(event);
+        const snapshot = xstateActor.getSnapshot();
 
-          // Sync if manual strategy
-          if (syncStrategy === 'on-event') {
-            const snapshot = xstateActor.getSnapshot();
-            syncStateToRivet(ctx, snapshot, persistenceMode, metadata);
+        // Call beforeEvent hook
+        if (hooks.beforeEvent) {
+          const result = await hooks.beforeEvent({
+            event,
+            snapshot,
+            state: ctx.state.fsm,
+            source: 'internal',
+          });
+
+          if ('allowed' in result && !result.allowed) {
+            throw new Error(`Event rejected: ${result.reason}`);
           }
 
-          const snapshot = xstateActor.getSnapshot();
-          const response: FsmResponse = {
-            state: snapshot.value,
-            context: snapshot.context,
-            done: snapshot.status === 'done',
-            output: snapshot.output,
-          };
+          // Check if event was transformed
+          if ('event' in result && result.event) {
+            event = result.event;
+          }
+        }
 
-          return new Response(JSON.stringify(response), {
-            headers: { 'Content-Type': 'application/json' },
-          });
-        } catch (error) {
-          logger.error('Failed to process event:', error);
-          return new Response(
-            JSON.stringify({ error: (error as Error).message }),
-            {
-              status: 400,
-              headers: { 'Content-Type': 'application/json' },
-            }
+        logger.log('Sending event:', event);
+        lastEvent = event;
+
+        // Send event to XState
+        xstateActor.send(event);
+
+        // Sync if configured
+        if (syncStrategy === 'on-event') {
+          const newSnapshot = xstateActor.getSnapshot();
+          await syncStateToRivet(
+            ctx,
+            newSnapshot,
+            persistenceMode,
+            metadata,
+            hooks,
+            logger
           );
         }
-      }
 
-      // Let RivetKit handle other routes
-      return;
+        // Call afterEvent hook
+        if (hooks.afterEvent) {
+          await hooks.afterEvent({
+            event,
+            snapshot: xstateActor.getSnapshot(),
+            state: ctx.state.fsm,
+            source: 'internal',
+          });
+        }
+
+        // Return updated state
+        const newSnapshot = xstateActor.getSnapshot();
+        return {
+          state: newSnapshot.value,
+          context: newSnapshot.context,
+          done: newSnapshot.status === 'done',
+          output: newSnapshot.output,
+        };
+      },
+
+      /**
+       * Manually trigger state synchronization
+       */
+      syncState: async (ctx) => {
+        const xstateActor = (ctx as any).xstateActor;
+        const hooks = (ctx as any).hooks || {};
+        const persistenceMode = (ctx as any).persistenceMode;
+        const metadata = (ctx as any).metadata;
+
+        if (!xstateActor) {
+          throw new Error('FSM actor not initialized');
+        }
+
+        const snapshot = xstateActor.getSnapshot();
+        await syncStateToRivet(
+          ctx,
+          snapshot,
+          persistenceMode,
+          metadata,
+          hooks,
+          logger
+        );
+
+        return { success: true };
+      },
     },
 
     /**
      * Handle WebSocket connections - bidirectional event streaming
      */
-    onWebSocket: (ctx, ws: WebSocket) => {
+    onWebSocket: async (ctx, ws: WebSocket) => {
       const xstateActor = (ctx as any).xstateActor;
+      const hooks = (ctx as any).hooks || {};
+      const persistenceMode = (ctx as any).persistenceMode;
+      const metadata = (ctx as any).metadata;
+
       if (!xstateActor) {
         ws.close(1011, 'FSM actor not initialized');
         return;
+      }
+
+      const snapshot = xstateActor.getSnapshot();
+
+      // Call beforeConnect hook
+      if (hooks.beforeConnect) {
+        try {
+          const result = await hooks.beforeConnect({
+            ws,
+            snapshot,
+            state: ctx.state.fsm,
+            metadata,
+          });
+
+          if (!result.allowed) {
+            ws.close(1008, `Connection rejected: ${result.reason}`);
+            return;
+          }
+        } catch (error) {
+          logger.error('beforeConnect hook failed:', error);
+          ws.close(1011, 'Connection hook failed');
+          return;
+        }
       }
 
       logger.log('WebSocket connected');
@@ -251,18 +523,67 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
       });
 
       // Handle incoming events from WebSocket
-      ws.addEventListener('message', (event) => {
+      ws.addEventListener('message', async (msgEvent) => {
         try {
-          const message: FsmWebSocketMessage = JSON.parse(event.data);
-          logger.log('Received WebSocket event:', message);
+          const message: FsmWebSocketMessage = JSON.parse(msgEvent.data);
 
-          // Send event to XState machine
-          xstateActor.send(message);
+          // Call beforeMessage hook
+          if (hooks.beforeMessage) {
+            const result = await hooks.beforeMessage({
+              ws,
+              snapshot: xstateActor.getSnapshot(),
+              state: ctx.state.fsm,
+              metadata,
+              message,
+            });
+
+            if ('allowed' in result && !result.allowed) {
+              ws.send(
+                JSON.stringify({
+                  type: 'ERROR',
+                  error: `Message rejected: ${result.reason}`,
+                })
+              );
+              return;
+            }
+
+            // Check if event was transformed
+            if ('event' in result && result.event) {
+              lastEvent = result.event;
+              xstateActor.send(result.event);
+            } else {
+              lastEvent = message;
+              xstateActor.send(message);
+            }
+          } else {
+            lastEvent = message;
+            xstateActor.send(message);
+          }
+
+          logger.log('Received WebSocket event:', message);
 
           // Sync if configured
           if (syncStrategy === 'on-event') {
             const snapshot = xstateActor.getSnapshot();
-            syncStateToRivet(ctx, snapshot, persistenceMode, metadata);
+            await syncStateToRivet(
+              ctx,
+              snapshot,
+              persistenceMode,
+              metadata,
+              hooks,
+              logger
+            );
+          }
+
+          // Call afterMessage hook
+          if (hooks.afterMessage) {
+            await hooks.afterMessage({
+              ws,
+              snapshot: xstateActor.getSnapshot(),
+              state: ctx.state.fsm,
+              metadata,
+              message,
+            });
           }
         } catch (error) {
           logger.error('Failed to process WebSocket message:', error);
@@ -276,58 +597,20 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
       });
 
       // Cleanup on disconnect
-      ws.addEventListener('close', () => {
+      ws.addEventListener('close', async () => {
         logger.log('WebSocket disconnected');
         unsubscribe();
+
+        // Call onDisconnect hook
+        if (hooks.onDisconnect) {
+          await hooks.onDisconnect({
+            ws,
+            snapshot: xstateActor.getSnapshot(),
+            state: ctx.state.fsm,
+            metadata,
+          });
+        }
       });
-    },
-
-    /**
-     * Restore XState actor on wake from hibernation
-     */
-    onWake: async (ctx) => {
-      logger.log('Waking FSM actor from hibernation');
-
-      try {
-        const storedState = ctx.state.fsm;
-
-        // Recreate XState actor from persisted state
-        const xstateActor = createXStateActor(machine, {
-          snapshot: storedState.snapshot
-            ? deserializeSnapshot(storedState.snapshot)
-            : undefined,
-        });
-
-        // Store reference
-        (ctx as any).xstateActor = xstateActor;
-
-        // Re-subscribe to state changes
-        xstateActor.subscribe({
-          next: (snapshot: Snapshot<unknown>) => {
-            if (syncStrategy === 'on-transition') {
-              syncStateToRivet(ctx, snapshot, persistenceMode, metadata);
-            }
-          },
-          error: (error: Error) => {
-            logger.error('XState actor error after wake:', error);
-            if (errorHandling === 'crash') {
-              throw error;
-            } else if (errorHandling === 'callback' && errorCallback) {
-              errorCallback(error, xstateActor.getSnapshot());
-            }
-          },
-        });
-
-        // Start the actor
-        xstateActor.start();
-
-        logger.log('FSM actor restored', {
-          currentState: xstateActor.getSnapshot().value,
-        });
-      } catch (error) {
-        logger.error('Failed to wake FSM actor:', error);
-        throw error;
-      }
     },
   });
 }
@@ -335,12 +618,34 @@ export function createFsmActor<TMachine extends AnyStateMachine>(
 /**
  * Helper function to sync XState state to RivetKit persistent state
  */
-function syncStateToRivet(
+async function syncStateToRivet(
   ctx: any,
   snapshot: Snapshot<unknown>,
   mode: string,
-  metadata: Record<string, unknown>
-): void {
+  metadata: Record<string, unknown>,
+  hooks: any,
+  logger: Logger
+): Promise<void> {
+  // Call beforeStateSync hook
+  if (hooks.beforeStateSync) {
+    try {
+      const result = await hooks.beforeStateSync({
+        snapshot,
+        state: ctx.state.fsm,
+        persistenceMode: mode,
+      });
+
+      if (!result.allowed) {
+        logger.warn('State sync rejected:', result.reason);
+        return;
+      }
+    } catch (error) {
+      logger.error('beforeStateSync hook failed:', error);
+      return;
+    }
+  }
+
+  // Perform sync
   switch (mode) {
     case 'full':
       ctx.state.fsm = snapshotToRivetState(snapshot, metadata);
@@ -351,5 +656,14 @@ function syncStateToRivet(
     case 'none':
       ctx.state.fsm = minimalRivetState(metadata);
       break;
+  }
+
+  // Call afterStateSync hook
+  if (hooks.afterStateSync) {
+    await hooks.afterStateSync({
+      snapshot,
+      state: ctx.state.fsm,
+      persistenceMode: mode,
+    });
   }
 }

@@ -36,6 +36,14 @@ export type {
   ErrorHandlingMode,
   SyncStrategy,
   ErrorCallback,
+  CallbackResult,
+  FsmActorHooks,
+  LifecycleCallbackContext,
+  RequestCallbackContext,
+  WebSocketCallbackContext,
+  EventCallbackContext,
+  TransitionCallbackContext,
+  StateSyncCallbackContext,
 } from './core/types';
 
 export {
